@@ -474,13 +474,39 @@ def home() -> dict[str, Any]:
     return {
         "success": True,
         "message": "M.A.P.S. ML API is running.",
-        "version": "1.1.0",
+        "version": "1.1.1",
+        "status": "running",
         "endpoints": {
+            "health": "/health",
             "live_weather": "/weather/live",
-            "citywide_prediction":
-                "/predict/citywide",
+            "citywide_prediction": "/predict/citywide",
             "documentation": "/docs",
         },
+    }
+
+
+@app.get("/health")
+def health() -> dict[str, Any]:
+    """
+    Health endpoint used by the Laravel application.
+
+    The deployed API uses one classification model and one combined
+    regression model. The combined regression model supplies both
+    flood-depth and flood-duration predictions.
+    """
+    classifier_loaded = classifier is not None
+    regression_loaded = regression_model is not None
+
+    return {
+        "status": (
+            "healthy"
+            if classifier_loaded and regression_loaded
+            else "degraded"
+        ),
+        "risk_model_loaded": classifier_loaded,
+        "depth_model_loaded": regression_loaded,
+        "duration_model_loaded": regression_loaded,
+        "metadata_loaded": False,
     }
 
 
