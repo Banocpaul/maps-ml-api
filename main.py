@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime
+import asyncio
+from copy import deepcopy
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -23,6 +25,14 @@ MODEL_DIR = APP_DIR / "models"
 MANDALUYONG_LATITUDE = 14.5794
 MANDALUYONG_LONGITUDE = 121.0359
 MANILA_TIMEZONE = "Asia/Manila"
+
+# Weather data is shared by the dashboard and citywide prediction.
+# Reusing one successful response prevents unnecessary Open-Meteo calls.
+WEATHER_CACHE_TTL_MINUTES = 15
+
+_weather_cache: dict[str, Any] | None = None
+_weather_cache_fetched_at: datetime | None = None
+_weather_cache_lock = asyncio.Lock()
 
 
 # ============================================================
@@ -246,223 +256,400 @@ def get_class_probability(
 # LIVE WEATHER
 # ============================================================
 
-async def fetch_live_weather() -> dict[str, Any]:
-    url = "https://api.open-meteo.com/v1/forecast"
+async def fetch_live_weather(
+    force_refresh: bool = False,
+) -> dict[str, Any]:
+    """
+    Retrieve Mandaluyong weather from Open-Meteo.
 
-    params = {
-        "latitude": MANDALUYONG_LATITUDE,
-        "longitude": MANDALUYONG_LONGITUDE,
+    Protection added for production:
+    - Fresh weather is cached for 15 minutes.
+    - Concurrent requests share the same refresh operation.
+    - If Open-Meteo is temporarily unavailable or returns HTTP 429,
+      the last successful weather response is returned as a stale fallback.
+    - The original weather fields used by Laravel and the prediction model
+      are preserved.
+    """
+    global _weather_cache
+    global _weather_cache_fetched_at
 
-        "current": ",".join(
-            [
-                "temperature_2m",
-                "relative_humidity_2m",
-                "precipitation",
-                "weather_code",
-                "wind_speed_10m",
-            ]
-        ),
+    manila_tz = ZoneInfo(MANILA_TIMEZONE)
+    now = datetime.now(manila_tz)
 
-        "hourly": ",".join(
-            [
-                "precipitation",
-                "temperature_2m",
-                "relative_humidity_2m",
-                "wind_speed_10m",
-                "weather_code",
-            ]
-        ),
+    def cache_is_fresh() -> bool:
+        if (
+            _weather_cache is None
+            or _weather_cache_fetched_at is None
+        ):
+            return False
 
-        "past_days": 7,
-        "forecast_days": 7,
-        "timezone": MANILA_TIMEZONE,
-    }
+        return (
+            now - _weather_cache_fetched_at
+            < timedelta(
+                minutes=WEATHER_CACHE_TTL_MINUTES
+            )
+        )
 
-    try:
-        async with httpx.AsyncClient(
-            timeout=30.0
-        ) as client:
-            response = await client.get(
-                url,
-                params=params,
+    def cached_response(
+        status: str,
+        fallback_reason: str | None = None,
+    ) -> dict[str, Any]:
+        if _weather_cache is None:
+            raise RuntimeError(
+                "Weather cache is empty."
             )
 
-            response.raise_for_status()
+        result = deepcopy(_weather_cache)
 
-    except httpx.TimeoutException as exc:
-        raise HTTPException(
-            status_code=504,
-            detail="Weather API request timed out.",
-        ) from exc
+        cache_age_seconds = 0
+        if _weather_cache_fetched_at is not None:
+            cache_age_seconds = max(
+                int(
+                    (
+                        datetime.now(manila_tz)
+                        - _weather_cache_fetched_at
+                    ).total_seconds()
+                ),
+                0,
+            )
 
-    except httpx.HTTPError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Unable to retrieve weather data: "
-                f"{exc}"
-            ),
-        ) from exc
-
-    payload = response.json()
-
-    current = payload.get("current", {})
-    hourly = payload.get("hourly", {})
-
-    times = hourly.get("time", [])
-    precipitation = hourly.get(
-        "precipitation",
-        [],
-    )
-
-    if not times or not precipitation:
-        raise HTTPException(
-            status_code=502,
-            detail="Weather API returned incomplete data.",
+        # These are additive metadata fields. Existing Laravel/model fields
+        # remain unchanged.
+        result["cache_status"] = status
+        result["cache_age_seconds"] = cache_age_seconds
+        result["cache_ttl_minutes"] = (
+            WEATHER_CACHE_TTL_MINUTES
         )
 
-    manila_now = datetime.now(
-        ZoneInfo(MANILA_TIMEZONE)
-    )
+        if fallback_reason:
+            result["weather_warning"] = fallback_reason
+        else:
+            result.pop(
+                "weather_warning",
+                None,
+            )
 
-    naive_now = manila_now.replace(
-        tzinfo=None,
-        minute=0,
-        second=0,
-        microsecond=0,
-    )
+        return result
 
-    parsed_times = [
-        datetime.fromisoformat(value)
-        for value in times
-    ]
+    # Fast path: do not contact Open-Meteo while cached data is fresh.
+    if not force_refresh and cache_is_fresh():
+        return cached_response("fresh-cache")
 
-    current_index = min(
-        range(len(parsed_times)),
-        key=lambda index: abs(
-            parsed_times[index] - naive_now
-        ),
-    )
+    # Prevent a burst of simultaneous Laravel requests from all refreshing
+    # Open-Meteo at the same time.
+    async with _weather_cache_lock:
+        now = datetime.now(manila_tz)
 
-    previous_values = precipitation[
-        : current_index + 1
-    ]
+        # Another request may already have refreshed the cache while this
+        # request was waiting for the lock.
+        if not force_refresh and cache_is_fresh():
+            return cached_response("fresh-cache")
 
-    future_values = precipitation[
-        current_index + 1:
-    ]
+        url = "https://api.open-meteo.com/v1/forecast"
 
-    observed_24h = sum_values(
-        previous_values[-24:]
-    )
+        params = {
+            "latitude": MANDALUYONG_LATITUDE,
+            "longitude": MANDALUYONG_LONGITUDE,
 
-    observed_3d = sum_values(
-        previous_values[-72:]
-    )
-
-    observed_7d = sum_values(
-        previous_values[-168:]
-    )
-
-    forecast_24h = sum_values(
-        future_values[:24]
-    )
-
-    forecast_3d = sum_values(
-        future_values[:72]
-    )
-
-    forecast_7d = sum_values(
-        future_values[:168]
-    )
-
-    weather_code = int(
-        safe_float(
-            current.get("weather_code"),
-            0,
-        )
-    )
-
-    weather_description = get_weather_description(
-        weather_code
-    )
-
-    return {
-        "source": "Open-Meteo",
-
-        "current_date": manila_now.strftime(
-            "%B %d, %Y"
-        ),
-
-        "current_time": manila_now.strftime(
-            "%I:%M:%S %p"
-        ),
-
-        "generated_at": manila_now.isoformat(),
-
-        "forecast_horizon": "Next 24 hours",
-
-        "condition":
-            weather_description["condition"],
-
-        "weather_icon":
-            weather_description["icon"],
-
-        "weather_code":
-            weather_code,
-
-        "temperature_c": round(
-            safe_float(
-                current.get("temperature_2m")
+            "current": ",".join(
+                [
+                    "temperature_2m",
+                    "relative_humidity_2m",
+                    "precipitation",
+                    "weather_code",
+                    "wind_speed_10m",
+                ]
             ),
-            2,
-        ),
 
-        "humidity_pct": round(
-            safe_float(
-                current.get(
-                    "relative_humidity_2m"
+            "hourly": ",".join(
+                [
+                    "precipitation",
+                    "temperature_2m",
+                    "relative_humidity_2m",
+                    "wind_speed_10m",
+                    "weather_code",
+                ]
+            ),
+
+            "past_days": 7,
+            "forecast_days": 7,
+            "timezone": MANILA_TIMEZONE,
+        }
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=30.0
+            ) as client:
+                response = await client.get(
+                    url,
+                    params=params,
                 )
-            ),
-            2,
-        ),
 
-        "wind_speed_kph": round(
+                response.raise_for_status()
+
+        except httpx.TimeoutException as exc:
+            if _weather_cache is not None:
+                return cached_response(
+                    "stale-fallback",
+                    (
+                        "Open-Meteo timed out. "
+                        "Using the last successful weather data."
+                    ),
+                )
+
+            raise HTTPException(
+                status_code=504,
+                detail="Weather API request timed out.",
+            ) from exc
+
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code
+
+            if _weather_cache is not None:
+                if status_code == 429:
+                    reason = (
+                        "Open-Meteo rate limit reached (HTTP 429). "
+                        "Using the last successful weather data."
+                    )
+                else:
+                    reason = (
+                        "Open-Meteo returned HTTP "
+                        f"{status_code}. "
+                        "Using the last successful weather data."
+                    )
+
+                return cached_response(
+                    "stale-fallback",
+                    reason,
+                )
+
+            if status_code == 429:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Open-Meteo rate limit reached (HTTP 429) "
+                        "and no cached weather is available yet. "
+                        "Please retry after a short interval."
+                    ),
+                ) from exc
+
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Unable to retrieve weather data: "
+                    f"Open-Meteo returned HTTP {status_code}."
+                ),
+            ) from exc
+
+        except httpx.RequestError as exc:
+            if _weather_cache is not None:
+                return cached_response(
+                    "stale-fallback",
+                    (
+                        "Open-Meteo is temporarily unreachable. "
+                        "Using the last successful weather data."
+                    ),
+                )
+
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Unable to retrieve weather data: "
+                    f"{exc}"
+                ),
+            ) from exc
+
+        payload = response.json()
+
+        current = payload.get("current", {})
+        hourly = payload.get("hourly", {})
+
+        times = hourly.get("time", [])
+        precipitation = hourly.get(
+            "precipitation",
+            [],
+        )
+
+        if not times or not precipitation:
+            if _weather_cache is not None:
+                return cached_response(
+                    "stale-fallback",
+                    (
+                        "Open-Meteo returned incomplete weather data. "
+                        "Using the last successful weather data."
+                    ),
+                )
+
+            raise HTTPException(
+                status_code=502,
+                detail="Weather API returned incomplete data.",
+            )
+
+        manila_now = datetime.now(
+            ZoneInfo(MANILA_TIMEZONE)
+        )
+
+        naive_now = manila_now.replace(
+            tzinfo=None,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+
+        try:
+            parsed_times = [
+                datetime.fromisoformat(value)
+                for value in times
+            ]
+        except (TypeError, ValueError) as exc:
+            if _weather_cache is not None:
+                return cached_response(
+                    "stale-fallback",
+                    (
+                        "Open-Meteo returned invalid time data. "
+                        "Using the last successful weather data."
+                    ),
+                )
+
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Weather API returned invalid time data."
+                ),
+            ) from exc
+
+        current_index = min(
+            range(len(parsed_times)),
+            key=lambda index: abs(
+                parsed_times[index] - naive_now
+            ),
+        )
+
+        previous_values = precipitation[
+            : current_index + 1
+        ]
+
+        future_values = precipitation[
+            current_index + 1:
+        ]
+
+        observed_24h = sum_values(
+            previous_values[-24:]
+        )
+
+        observed_3d = sum_values(
+            previous_values[-72:]
+        )
+
+        observed_7d = sum_values(
+            previous_values[-168:]
+        )
+
+        forecast_24h = sum_values(
+            future_values[:24]
+        )
+
+        forecast_3d = sum_values(
+            future_values[:72]
+        )
+
+        forecast_7d = sum_values(
+            future_values[:168]
+        )
+
+        weather_code = int(
             safe_float(
-                current.get("wind_speed_10m")
+                current.get("weather_code"),
+                0,
+            )
+        )
+
+        weather_description = get_weather_description(
+            weather_code
+        )
+
+        weather = {
+            "source": "Open-Meteo",
+
+            "current_date": manila_now.strftime(
+                "%B %d, %Y"
             ),
-            2,
-        ),
 
-        "current_precipitation_mm": round(
-            safe_float(
-                current.get("precipitation")
+            "current_time": manila_now.strftime(
+                "%I:%M:%S %p"
             ),
-            2,
-        ),
 
-        "observed_rainfall": {
-            "past_24h_mm": observed_24h,
-            "past_3d_mm": observed_3d,
-            "past_7d_mm": observed_7d,
-        },
+            "generated_at": manila_now.isoformat(),
 
-        "forecast_rainfall": {
-            "next_24h_mm": forecast_24h,
-            "next_3d_mm": forecast_3d,
-            "next_7d_mm": forecast_7d,
-        },
+            "forecast_horizon": "Next 24 hours",
 
-        # These values are temporary until official automatic
-        # PAGASA and tide sources are connected.
-        "storm_signal": 0,
-        "storm_signal_source":
-            "No automatic official PAGASA signal connected",
+            "condition":
+                weather_description["condition"],
 
-        "tide_level_m": 0.0,
-        "tide_source":
-            "No automatic tide source connected",
-    }
+            "weather_icon":
+                weather_description["icon"],
+
+            "weather_code":
+                weather_code,
+
+            "temperature_c": round(
+                safe_float(
+                    current.get("temperature_2m")
+                ),
+                2,
+            ),
+
+            "humidity_pct": round(
+                safe_float(
+                    current.get(
+                        "relative_humidity_2m"
+                    )
+                ),
+                2,
+            ),
+
+            "wind_speed_kph": round(
+                safe_float(
+                    current.get("wind_speed_10m")
+                ),
+                2,
+            ),
+
+            "current_precipitation_mm": round(
+                safe_float(
+                    current.get("precipitation")
+                ),
+                2,
+            ),
+
+            "observed_rainfall": {
+                "past_24h_mm": observed_24h,
+                "past_3d_mm": observed_3d,
+                "past_7d_mm": observed_7d,
+            },
+
+            "forecast_rainfall": {
+                "next_24h_mm": forecast_24h,
+                "next_3d_mm": forecast_3d,
+                "next_7d_mm": forecast_7d,
+            },
+
+            # These values remain exactly as in the current project until
+            # official automatic PAGASA and tide integrations are connected.
+            "storm_signal": 0,
+            "storm_signal_source":
+                "No automatic official PAGASA signal connected",
+
+            "tide_level_m": 0.0,
+            "tide_source":
+                "No automatic tide source connected",
+        }
+
+        # Save ONLY a successful, complete Open-Meteo response.
+        _weather_cache = deepcopy(weather)
+        _weather_cache_fetched_at = manila_now
+
+        return cached_response("live-refresh")
 
 
 # ============================================================
