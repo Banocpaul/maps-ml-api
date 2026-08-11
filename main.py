@@ -1176,15 +1176,35 @@ async def predict_citywide(
                 "legacy_probabilities":
                     probabilities,
 
-                # Keep these aliases temporarily if Laravel still reads them.
-                "confidence":
-                    round(
-                        confidence,
-                        6,
-                    ),
+               # Primary confidence now follows Flood Occurrence V2.
+# For Flood, confidence equals the flood probability.
+# For No Flood, confidence equals 1 minus the flood probability.
+"confidence":
+    round(
+        occurrence_probability
+        if flood_predicted
+        else 1.0 - occurrence_probability,
+        6,
+    ),
 
-                "probabilities":
-                    probabilities,
+# Explicit binary probabilities from Flood Occurrence V2.
+"occurrence_probabilities": {
+    "Flood":
+        round(
+            occurrence_probability,
+            6,
+        ),
+    "No Flood":
+        round(
+            1.0 - occurrence_probability,
+            6,
+        ),
+},
+
+# Retained temporarily because the existing Laravel interface
+# may still expect High, Medium, and Low probability keys.
+"probabilities":
+    probabilities,
 
                 # Depth remains from the legacy regression model until a
                 # replacement depth model is validated.
