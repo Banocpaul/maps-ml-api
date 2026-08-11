@@ -41,10 +41,10 @@ _weather_cache_lock = asyncio.Lock()
 
 app = FastAPI(
     title="M.A.P.S. ML API",
-    version="1.1.0",
+    version="2.0.0",
     description=(
-        "Automatic live-weather flood classification "
-        "and regression service for Mandaluyong City."
+        "Live-weather flood occurrence, risk, depth, and duration "
+        "prediction service for Mandaluyong City."
     ),
 )
 
@@ -64,12 +64,31 @@ def load_model(filename: str) -> Any:
     return joblib.load(model_path)
 
 
+# Legacy models are retained temporarily because the Laravel application
+# still consumes risk_level and predicted_depth_mm.
 classifier = load_model(
     "maps_flood_risk_classifier.joblib"
 )
 
 regression_model = load_model(
     "maps_flood_regression_model.joblib"
+)
+
+# Final V2 models built from the Open-Meteo + geographic enrichment workflow.
+occurrence_v2_model = load_model(
+    "maps_flood_occurrence_v2.joblib"
+)
+
+occurrence_v2_config = load_model(
+    "maps_flood_occurrence_v2_config.joblib"
+)
+
+duration_v2_model = load_model(
+    "maps_flood_duration_v2.joblib"
+)
+
+OCCURRENCE_V2_THRESHOLD = float(
+    occurrence_v2_config.get("threshold", 0.18)
 )
 
 
@@ -84,10 +103,17 @@ class BarangayProfile(BaseModel):
 
     elevation_m: float
     distance_to_waterway_m: float
+
+    # Legacy fields are still accepted for the older risk/depth models.
     drainage_index: float
     impervious_surface_ratio: float
     population_density_per_km2: float
     historical_flood_count_5y: int
+
+    # V2 fields. Defaults keep existing Laravel requests backward-compatible.
+    waterway_type: str = "Unknown"
+    previous_floods_30d: int = 0
+    days_since_previous_flood: float = 999.0
 
 
 class CitywidePredictionRequest(BaseModel):
@@ -128,6 +154,59 @@ def sum_values(
         ),
         2,
     )
+
+
+def clean_barangay_name(name: str) -> str:
+    """
+    Standardize common Mandaluyong barangay name variants so that live
+    requests match the categories used when the V2 models were trained.
+    """
+    cleaned = " ".join(str(name).strip().split())
+
+    mapping = {
+        "New Zaniga": "New Zañiga",
+        "Old Zaniga": "Old Zañiga",
+        "Pagasa": "Pag-Asa",
+        "Pag-asa": "Pag-Asa",
+        "Mabini J. Rizal": "Mabini-J. Rizal",
+        "Mabini J Rizal": "Mabini-J. Rizal",
+        "Plainiew": "Plainview",
+        "Boni": "Plainview",
+    }
+
+    return mapping.get(cleaned, cleaned)
+
+
+def mean_values(
+    values: list[Any],
+    default: float = 0.0,
+) -> float:
+    numeric = [
+        safe_float(value)
+        for value in values
+        if value is not None
+    ]
+
+    if not numeric:
+        return default
+
+    return round(float(np.mean(numeric)), 2)
+
+
+def max_values(
+    values: list[Any],
+    default: float = 0.0,
+) -> float:
+    numeric = [
+        safe_float(value)
+        for value in values
+        if value is not None
+    ]
+
+    if not numeric:
+        return default
+
+    return round(float(np.max(numeric)), 2)
 
 
 def get_weather_description(
@@ -469,6 +548,18 @@ async def fetch_live_weather(
             "precipitation",
             [],
         )
+        hourly_temperature = hourly.get(
+            "temperature_2m",
+            [],
+        )
+        hourly_humidity = hourly.get(
+            "relative_humidity_2m",
+            [],
+        )
+        hourly_wind = hourly.get(
+            "wind_speed_10m",
+            [],
+        )
 
         if not times or not precipitation:
             if _weather_cache is not None:
@@ -557,6 +648,54 @@ async def fetch_live_weather(
             future_values[:168]
         )
 
+        # V2 live feature window. We include the current hour plus the next
+        # 23 hours so that the model receives a full 24-hour forecast window.
+        window_start = current_index
+        window_end = min(
+            current_index + 24,
+            len(parsed_times),
+        )
+
+        next_24h_precip = precipitation[
+            window_start:window_end
+        ]
+        next_24h_temperature = hourly_temperature[
+            window_start:window_end
+        ]
+        next_24h_humidity = hourly_humidity[
+            window_start:window_end
+        ]
+        next_24h_wind = hourly_wind[
+            window_start:window_end
+        ]
+
+        v2_daily_rain = sum_values(
+            next_24h_precip
+        )
+        v2_max_hourly_rain = max_values(
+            next_24h_precip
+        )
+        v2_temperature_mean = mean_values(
+            next_24h_temperature,
+            safe_float(current.get("temperature_2m")),
+        )
+        v2_temperature_max = max_values(
+            next_24h_temperature,
+            safe_float(current.get("temperature_2m")),
+        )
+        v2_humidity_mean = mean_values(
+            next_24h_humidity,
+            safe_float(current.get("relative_humidity_2m")),
+        )
+        v2_wind_mean = mean_values(
+            next_24h_wind,
+            safe_float(current.get("wind_speed_10m")),
+        )
+        v2_wind_max = max_values(
+            next_24h_wind,
+            safe_float(current.get("wind_speed_10m")),
+        )
+
         weather_code = int(
             safe_float(
                 current.get("weather_code"),
@@ -634,6 +773,20 @@ async def fetch_live_weather(
                 "next_7d_mm": forecast_7d,
             },
 
+            # Features consumed directly by the final V2 sklearn pipelines.
+            "v2_features": {
+                "temperature_mean_c": v2_temperature_mean,
+                "temperature_max_c": v2_temperature_max,
+                "humidity_mean_pct": v2_humidity_mean,
+                "daily_rain_mm": v2_daily_rain,
+                "max_hourly_rain_mm": v2_max_hourly_rain,
+                "rainfall_24h_mm": v2_daily_rain,
+                "rainfall_3d_mm": observed_3d,
+                "rainfall_7d_mm": observed_7d,
+                "wind_speed_mean_kph": v2_wind_mean,
+                "wind_speed_max_kph": v2_wind_max,
+            },
+
             # These values remain exactly as in the current project until
             # official automatic PAGASA and tide integrations are connected.
             "storm_signal": 0,
@@ -661,7 +814,7 @@ def home() -> dict[str, Any]:
     return {
         "success": True,
         "message": "M.A.P.S. ML API is running.",
-        "version": "1.1.1",
+        "version": "2.0.0",
         "status": "running",
         "endpoints": {
             "health": "/health",
@@ -674,26 +827,28 @@ def home() -> dict[str, Any]:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    """
-    Health endpoint used by the Laravel application.
+    """Health endpoint used by Laravel and Render."""
+    legacy_risk_loaded = classifier is not None
+    legacy_regression_loaded = regression_model is not None
+    occurrence_v2_loaded = occurrence_v2_model is not None
+    duration_v2_loaded = duration_v2_model is not None
 
-    The deployed API uses one classification model and one combined
-    regression model. The combined regression model supplies both
-    flood-depth and flood-duration predictions.
-    """
-    classifier_loaded = classifier is not None
-    regression_loaded = regression_model is not None
+    healthy = (
+        occurrence_v2_loaded
+        and duration_v2_loaded
+        and legacy_risk_loaded
+        and legacy_regression_loaded
+    )
 
     return {
-        "status": (
-            "healthy"
-            if classifier_loaded and regression_loaded
-            else "degraded"
-        ),
-        "risk_model_loaded": classifier_loaded,
-        "depth_model_loaded": regression_loaded,
-        "duration_model_loaded": regression_loaded,
-        "metadata_loaded": False,
+        "status": "healthy" if healthy else "degraded",
+        "api_version": "2.0.0",
+        "occurrence_v2_loaded": occurrence_v2_loaded,
+        "duration_v2_loaded": duration_v2_loaded,
+        "occurrence_threshold": OCCURRENCE_V2_THRESHOLD,
+        "legacy_risk_model_loaded": legacy_risk_loaded,
+        "legacy_depth_model_loaded": legacy_regression_loaded,
+        "metadata_loaded": True,
     }
 
 
@@ -724,38 +879,84 @@ async def predict_citywide(
     )
 
     month = manila_now.month
-
-    is_weekend = (
-        1
-        if manila_now.weekday() >= 5
-        else 0
-    )
-
-    wet_season = (
-        1
-        if 5 <= month <= 11
-        else 0
-    )
+    day_of_week = manila_now.weekday()
+    is_weekend = 1 if day_of_week >= 5 else 0
+    wet_season = 1 if 5 <= month <= 11 else 0
 
     storm_signal = int(
         weather["storm_signal"]
     )
-
     tide_level_m = float(
         weather["tide_level_m"]
     )
 
-    observed = weather[
-        "observed_rainfall"
-    ]
-
-    forecast = weather[
-        "forecast_rainfall"
-    ]
+    observed = weather["observed_rainfall"]
+    forecast = weather["forecast_rainfall"]
+    v2_weather = weather["v2_features"]
 
     results: list[dict[str, Any]] = []
 
     for profile in request.barangays:
+        barangay_clean = clean_barangay_name(
+            profile.barangay
+        )
+
+        # --------------------------------------------------------
+        # FINAL V2 INPUT
+        # The occurrence and duration V2 pipelines were intentionally
+        # trained with the same 22 raw input fields.
+        # --------------------------------------------------------
+        v2_input = pd.DataFrame(
+            [
+                {
+                    "temperature_mean_c":
+                        v2_weather["temperature_mean_c"],
+                    "temperature_max_c":
+                        v2_weather["temperature_max_c"],
+                    "humidity_mean_pct":
+                        v2_weather["humidity_mean_pct"],
+                    "daily_rain_mm":
+                        v2_weather["daily_rain_mm"],
+                    "max_hourly_rain_mm":
+                        v2_weather["max_hourly_rain_mm"],
+                    "rainfall_24h_mm":
+                        v2_weather["rainfall_24h_mm"],
+                    "rainfall_3d_mm":
+                        v2_weather["rainfall_3d_mm"],
+                    "rainfall_7d_mm":
+                        v2_weather["rainfall_7d_mm"],
+                    "wind_speed_mean_kph":
+                        v2_weather["wind_speed_mean_kph"],
+                    "wind_speed_max_kph":
+                        v2_weather["wind_speed_max_kph"],
+                    "month": month,
+                    "day_of_week": day_of_week,
+                    "is_weekend": is_weekend,
+                    "wet_season": wet_season,
+                    "historical_flood_count":
+                        profile.historical_flood_count_5y,
+                    "previous_floods_30d":
+                        profile.previous_floods_30d,
+                    "days_since_previous_flood":
+                        profile.days_since_previous_flood,
+                    "elevation_m":
+                        profile.elevation_m,
+                    "distance_to_waterway_m":
+                        profile.distance_to_waterway_m,
+                    "BARANGAY_CLEAN":
+                        barangay_clean,
+                    "nearest_waterway":
+                        profile.nearest_waterway,
+                    "waterway_type":
+                        profile.waterway_type,
+                }
+            ]
+        )
+
+        # --------------------------------------------------------
+        # LEGACY INPUTS
+        # Retained so existing Laravel risk/depth components keep working.
+        # --------------------------------------------------------
         classification_input = pd.DataFrame(
             [
                 {
@@ -763,8 +964,7 @@ async def predict_citywide(
                     "is_weekend": is_weekend,
                     "wet_season": wet_season,
                     "storm_signal": storm_signal,
-                    "barangay":
-                        profile.barangay,
+                    "barangay": profile.barangay,
                     "nearest_waterway":
                         profile.nearest_waterway,
                     "elevation_m":
@@ -779,27 +979,20 @@ async def predict_citywide(
                         profile.population_density_per_km2,
                     "historical_flood_count_5y":
                         profile.historical_flood_count_5y,
-
                     "rainfall_24h_mm":
                         forecast["next_24h_mm"],
-
                     "rainfall_3d_mm":
                         observed["past_3d_mm"]
                         + forecast["next_3d_mm"],
-
                     "rainfall_7d_mm":
                         observed["past_7d_mm"]
                         + forecast["next_7d_mm"],
-
                     "temperature_c":
                         weather["temperature_c"],
-
                     "humidity_pct":
                         weather["humidity_pct"],
-
                     "wind_speed_kph":
                         weather["wind_speed_kph"],
-
                     "tide_level_m":
                         tide_level_m,
                 }
@@ -812,8 +1005,7 @@ async def predict_citywide(
                     "month": month,
                     "wet_season": wet_season,
                     "storm_signal": storm_signal,
-                    "barangay":
-                        profile.barangay,
+                    "barangay": profile.barangay,
                     "nearest_waterway":
                         profile.nearest_waterway,
                     "elevation_m":
@@ -828,27 +1020,20 @@ async def predict_citywide(
                         profile.population_density_per_km2,
                     "historical_flood_count_5y":
                         profile.historical_flood_count_5y,
-
                     "rainfall_24h_mm":
                         forecast["next_24h_mm"],
-
                     "rainfall_3d_mm":
                         observed["past_3d_mm"]
                         + forecast["next_3d_mm"],
-
                     "rainfall_7d_mm":
                         observed["past_7d_mm"]
                         + forecast["next_7d_mm"],
-
                     "temperature_c":
                         weather["temperature_c"],
-
                     "humidity_pct":
                         weather["humidity_pct"],
-
                     "wind_speed_kph":
                         weather["wind_speed_kph"],
-
                     "tide_level_m":
                         tide_level_m,
                 }
@@ -856,6 +1041,47 @@ async def predict_citywide(
         )
 
         try:
+            # ---------------- FINAL OCCURRENCE V2 ----------------
+            occurrence_probability = float(
+                occurrence_v2_model.predict_proba(
+                    v2_input
+                )[0, 1]
+            )
+
+            flood_predicted = (
+                occurrence_probability
+                >= OCCURRENCE_V2_THRESHOLD
+            )
+
+            occurrence_label = (
+                "Flood"
+                if flood_predicted
+                else "No Flood"
+            )
+
+            # ---------------- PRIMARY V2 RISK --------------------
+            # Keep the main UI consistent with Occurrence V2.
+            if not flood_predicted:
+                risk_level_v2 = "Low"
+                risk_score_v2 = 1
+            elif occurrence_probability >= 0.50:
+                risk_level_v2 = "High"
+                risk_score_v2 = 3
+            else:
+                risk_level_v2 = "Medium"
+                risk_score_v2 = 2
+
+            # ---------------- FINAL DURATION V2 ------------------
+            predicted_duration_v2 = max(
+                float(
+                    duration_v2_model.predict(
+                        v2_input
+                    )[0]
+                ),
+                0.0,
+            )
+
+            # ---------------- LEGACY OUTPUTS ---------------------
             risk_level = str(
                 classifier.predict(
                     classification_input
@@ -878,7 +1104,7 @@ async def predict_citywide(
 
             (
                 predicted_depth,
-                predicted_duration,
+                legacy_predicted_duration,
             ) = extract_regression_outputs(
                 raw_regression
             )
@@ -900,15 +1126,57 @@ async def predict_citywide(
                 "barangay":
                     profile.barangay,
 
+                # Final V2 occurrence output.
+                "flood_occurrence":
+                    occurrence_label,
+
+                "flood_predicted":
+                    flood_predicted,
+
+                "flood_probability":
+                    round(
+                        occurrence_probability,
+                        6,
+                    ),
+
+                "occurrence_threshold":
+                    round(
+                        OCCURRENCE_V2_THRESHOLD,
+                        4,
+                    ),
+
+                "occurrence_model":
+                    "MAPS Flood Occurrence V2",
+
+                # Primary risk fields now follow Occurrence V2 so that
+                # the UI cannot show "No Flood" together with Medium/High risk.
                 "risk_level":
-                    risk_level,
+                    risk_level_v2,
 
                 "risk_score":
+                    risk_score_v2,
+
+                # Legacy classifier values are preserved for comparison and
+                # backward-compatible analytics/debugging.
+                "legacy_risk_level":
+                    risk_level,
+
+                "legacy_risk_score":
                     RISK_SCORE.get(
                         risk_level,
                         0,
                     ),
 
+                "legacy_confidence":
+                    round(
+                        confidence,
+                        6,
+                    ),
+
+                "legacy_probabilities":
+                    probabilities,
+
+                # Keep these aliases temporarily if Laravel still reads them.
                 "confidence":
                     round(
                         confidence,
@@ -918,38 +1186,58 @@ async def predict_citywide(
                 "probabilities":
                     probabilities,
 
+                # Depth remains from the legacy regression model until a
+                # replacement depth model is validated.
                 "predicted_depth_mm":
                     predicted_depth,
 
+                # Final V2 duration replaces the old duration value.
                 "predicted_duration_hours":
-                    predicted_duration,
+                    round(
+                        predicted_duration_v2,
+                        2,
+                    ),
+
+                "duration_model":
+                    "MAPS Flood Duration V2",
+
+                # Included temporarily for comparison/debugging.
+                "legacy_predicted_duration_hours":
+                    legacy_predicted_duration,
 
                 "cluster_number":
                     "Not used for live prediction",
 
                 "profile": {
+                    "barangay_clean":
+                        barangay_clean,
                     "nearest_waterway":
                         profile.nearest_waterway,
-
+                    "waterway_type":
+                        profile.waterway_type,
                     "elevation_m":
                         profile.elevation_m,
-
                     "distance_to_waterway_m":
                         profile.distance_to_waterway_m,
-
                     "drainage_index":
                         profile.drainage_index,
-
                     "historical_flood_count_5y":
                         profile.historical_flood_count_5y,
+                    "previous_floods_30d":
+                        profile.previous_floods_30d,
+                    "days_since_previous_flood":
+                        profile.days_since_previous_flood,
                 },
             }
         )
 
+    # V2 occurrence probability is now the primary citywide ranking signal.
+    # Legacy risk/depth are secondary tie-breakers for compatibility.
     results.sort(
         key=lambda item: (
+            int(item["flood_predicted"]),
+            item["flood_probability"],
             item["risk_score"],
-            item["confidence"],
             item["predicted_depth_mm"],
         ),
         reverse=True,
@@ -979,6 +1267,19 @@ async def predict_citywide(
         ),
     }
 
+    occurrence_distribution = {
+        "Flood": sum(
+            1
+            for result in results
+            if result["flood_predicted"]
+        ),
+        "No Flood": sum(
+            1
+            for result in results
+            if not result["flood_predicted"]
+        ),
+    }
+
     return {
         "success": True,
 
@@ -988,6 +1289,17 @@ async def predict_citywide(
         "prediction_horizon":
             "Next 24 hours",
 
+        "models": {
+            "occurrence":
+                "MAPS Flood Occurrence V2",
+            "duration":
+                "MAPS Flood Duration V2",
+            "legacy_risk":
+                "maps_flood_risk_classifier.joblib",
+            "legacy_depth":
+                "maps_flood_regression_model.joblib",
+        },
+
         "weather":
             weather,
 
@@ -995,6 +1307,22 @@ async def predict_citywide(
             "total_barangays":
                 len(results),
 
+            "occurrence_threshold":
+                OCCURRENCE_V2_THRESHOLD,
+
+            "occurrence_distribution":
+                occurrence_distribution,
+
+            "predicted_flood_barangays":
+                occurrence_distribution["Flood"],
+
+            "highest_flood_probability":
+                max(
+                    item["flood_probability"]
+                    for item in results
+                ),
+
+            # Legacy summary retained for Laravel compatibility.
             "risk_distribution":
                 risk_distribution,
 
