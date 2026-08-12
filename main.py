@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from copy import deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -28,11 +29,72 @@ MANILA_TIMEZONE = "Asia/Manila"
 
 # Weather data is shared by the dashboard and citywide prediction.
 # Reusing one successful response prevents unnecessary Open-Meteo calls.
-WEATHER_CACHE_TTL_MINUTES = 15
+WEATHER_CACHE_TTL_MINUTES = 30
+WEATHER_CACHE_FILE = APP_DIR / "weather_cache.json"
+OPEN_METEO_MAX_ATTEMPTS = 3
 
 _weather_cache: dict[str, Any] | None = None
 _weather_cache_fetched_at: datetime | None = None
 _weather_cache_lock = asyncio.Lock()
+
+
+def load_persisted_weather_cache() -> tuple[
+    dict[str, Any] | None,
+    datetime | None,
+]:
+    """Load the last successful weather response after a process restart."""
+    if not WEATHER_CACHE_FILE.exists():
+        return None, None
+
+    try:
+        persisted = json.loads(
+            WEATHER_CACHE_FILE.read_text(encoding="utf-8")
+        )
+        weather = persisted.get("weather")
+        fetched_at_raw = persisted.get("fetched_at")
+
+        if not isinstance(weather, dict) or not fetched_at_raw:
+            return None, None
+
+        fetched_at = datetime.fromisoformat(str(fetched_at_raw))
+
+        if fetched_at.tzinfo is None:
+            fetched_at = fetched_at.replace(
+                tzinfo=ZoneInfo(MANILA_TIMEZONE)
+            )
+
+        return weather, fetched_at
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None, None
+
+
+def persist_weather_cache(
+    weather: dict[str, Any],
+    fetched_at: datetime,
+) -> None:
+    """Persist weather atomically for Render process restarts."""
+    temporary_file = WEATHER_CACHE_FILE.with_suffix(".tmp")
+
+    try:
+        temporary_file.write_text(
+            json.dumps(
+                {
+                    "fetched_at": fetched_at.isoformat(),
+                    "weather": weather,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        temporary_file.replace(WEATHER_CACHE_FILE)
+    except OSError:
+        # In-memory caching still works if the filesystem is unavailable.
+        temporary_file.unlink(missing_ok=True)
+
+
+_weather_cache, _weather_cache_fetched_at = (
+    load_persisted_weather_cache()
+)
 
 
 # ============================================================
@@ -459,10 +521,34 @@ async def fetch_live_weather(
             async with httpx.AsyncClient(
                 timeout=30.0
             ) as client:
-                response = await client.get(
-                    url,
-                    params=params,
-                )
+                response: httpx.Response | None = None
+
+                for attempt in range(OPEN_METEO_MAX_ATTEMPTS):
+                    response = await client.get(
+                        url,
+                        params=params,
+                    )
+
+                    if response.status_code != 429:
+                        break
+
+                    if attempt < OPEN_METEO_MAX_ATTEMPTS - 1:
+                        retry_after = response.headers.get(
+                            "Retry-After"
+                        )
+                        delay_seconds = (
+                            safe_float(retry_after, 0.0)
+                            if retry_after
+                            else float(2 ** attempt)
+                        )
+                        await asyncio.sleep(
+                            max(delay_seconds, 1.0)
+                        )
+
+                if response is None:
+                    raise httpx.RequestError(
+                        "Open-Meteo returned no response."
+                    )
 
                 response.raise_for_status()
 
@@ -801,6 +887,10 @@ async def fetch_live_weather(
         # Save ONLY a successful, complete Open-Meteo response.
         _weather_cache = deepcopy(weather)
         _weather_cache_fetched_at = manila_now
+        persist_weather_cache(
+            _weather_cache,
+            _weather_cache_fetched_at,
+        )
 
         return cached_response("live-refresh")
 
