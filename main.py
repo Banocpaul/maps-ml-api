@@ -126,16 +126,6 @@ def load_model(filename: str) -> Any:
     return joblib.load(model_path)
 
 
-# Legacy models are retained temporarily because the Laravel application
-# still consumes risk_level and predicted_depth_mm.
-classifier = load_model(
-    "maps_flood_risk_classifier.joblib"
-)
-
-regression_model = load_model(
-    "maps_flood_regression_model.joblib"
-)
-
 # Final V2 models built from the Open-Meteo + geographic enrichment workflow.
 occurrence_v2_model = load_model(
     "maps_flood_occurrence_v2.joblib"
@@ -995,8 +985,6 @@ def home() -> dict[str, Any]:
 @app.get("/health")
 def health() -> dict[str, Any]:
     """Health endpoint used by Laravel and Render."""
-    legacy_risk_loaded = classifier is not None
-    legacy_regression_loaded = regression_model is not None
     occurrence_v2_loaded = occurrence_v2_model is not None
     duration_v2_loaded = duration_v2_model is not None
     severity_model_loaded = severity_model_bundle is not None
@@ -1005,8 +993,6 @@ def health() -> dict[str, Any]:
     healthy = (
         occurrence_v2_loaded
         and duration_v2_loaded
-        and legacy_risk_loaded
-        and legacy_regression_loaded
         and severity_model_loaded
         and depth_feet_model_loaded
     )
@@ -1017,8 +1003,8 @@ def health() -> dict[str, Any]:
         "occurrence_v2_loaded": occurrence_v2_loaded,
         "duration_v2_loaded": duration_v2_loaded,
         "occurrence_threshold": OCCURRENCE_V2_THRESHOLD,
-        "legacy_risk_model_loaded": legacy_risk_loaded,
-        "legacy_depth_model_loaded": legacy_regression_loaded,
+        "legacy_risk_model_loaded": False,
+        "legacy_depth_model_loaded": False,
         "flood_severity_model_loaded": severity_model_loaded,
         "flood_depth_feet_model_loaded": depth_feet_model_loaded,
         "metadata_loaded": True,
@@ -1126,93 +1112,6 @@ async def predict_citywide(
             ]
         )
 
-        # --------------------------------------------------------
-        # LEGACY INPUTS
-        # Retained so existing Laravel risk/depth components keep working.
-        # --------------------------------------------------------
-        classification_input = pd.DataFrame(
-            [
-                {
-                    "month": month,
-                    "is_weekend": is_weekend,
-                    "wet_season": wet_season,
-                    "storm_signal": storm_signal,
-                    "barangay": profile.barangay,
-                    "nearest_waterway":
-                        profile.nearest_waterway,
-                    "elevation_m":
-                        profile.elevation_m,
-                    "distance_to_waterway_m":
-                        profile.distance_to_waterway_m,
-                    "drainage_index":
-                        profile.drainage_index,
-                    "impervious_surface_ratio":
-                        profile.impervious_surface_ratio,
-                    "population_density_per_km2":
-                        profile.population_density_per_km2,
-                    "historical_flood_count_5y":
-                        profile.historical_flood_count_5y,
-                    "rainfall_24h_mm":
-                        forecast["next_24h_mm"],
-                    "rainfall_3d_mm":
-                        observed["past_3d_mm"]
-                        + forecast["next_3d_mm"],
-                    "rainfall_7d_mm":
-                        observed["past_7d_mm"]
-                        + forecast["next_7d_mm"],
-                    "temperature_c":
-                        weather["temperature_c"],
-                    "humidity_pct":
-                        weather["humidity_pct"],
-                    "wind_speed_kph":
-                        weather["wind_speed_kph"],
-                    "tide_level_m":
-                        tide_level_m,
-                }
-            ]
-        )
-
-        regression_input = pd.DataFrame(
-            [
-                {
-                    "month": month,
-                    "wet_season": wet_season,
-                    "storm_signal": storm_signal,
-                    "barangay": profile.barangay,
-                    "nearest_waterway":
-                        profile.nearest_waterway,
-                    "elevation_m":
-                        profile.elevation_m,
-                    "distance_to_waterway_m":
-                        profile.distance_to_waterway_m,
-                    "drainage_index":
-                        profile.drainage_index,
-                    "impervious_surface_ratio":
-                        profile.impervious_surface_ratio,
-                    "population_density_per_km2":
-                        profile.population_density_per_km2,
-                    "historical_flood_count_5y":
-                        profile.historical_flood_count_5y,
-                    "rainfall_24h_mm":
-                        forecast["next_24h_mm"],
-                    "rainfall_3d_mm":
-                        observed["past_3d_mm"]
-                        + forecast["next_3d_mm"],
-                    "rainfall_7d_mm":
-                        observed["past_7d_mm"]
-                        + forecast["next_7d_mm"],
-                    "temperature_c":
-                        weather["temperature_c"],
-                    "humidity_pct":
-                        weather["humidity_pct"],
-                    "wind_speed_kph":
-                        weather["wind_speed_kph"],
-                    "tide_level_m":
-                        tide_level_m,
-                }
-            ]
-        )
-
         flood_code_input = build_flood_code_input(
             severity_model_bundle,
             profile,
@@ -1261,34 +1160,6 @@ async def predict_citywide(
                 0.0,
             )
 
-            # ---------------- LEGACY OUTPUTS ---------------------
-            risk_level = str(
-                classifier.predict(
-                    classification_input
-                )[0]
-            )
-
-            confidence, probabilities = (
-                get_class_probability(
-                    classifier,
-                    classification_input,
-                    risk_level,
-                )
-            )
-
-            raw_regression = (
-                regression_model.predict(
-                    regression_input
-                )[0]
-            )
-
-            (
-                predicted_depth,
-                legacy_predicted_duration,
-            ) = extract_regression_outputs(
-                raw_regression
-            )
-
             # ---------------- FLOOD CODE + DEPTH IN FEET --------
             # The A-D code and feet estimate are supplemental outputs from
             # the latest CDRRMO-record model. Existing fields remain intact.
@@ -1322,6 +1193,16 @@ async def predict_citywide(
                 ),
                 0.0,
             )
+
+            # Compatibility values allow the existing Laravel views to keep
+            # working without retaining two large legacy models in memory.
+            predicted_depth_mm = predicted_depth_ft * 304.8
+            legacy_predicted_duration = predicted_duration_v2
+            probabilities = {
+                "Low": round(1.0 - occurrence_probability, 6),
+                "Medium": round(occurrence_probability, 6),
+                "High": round(occurrence_probability, 6),
+            }
 
         except Exception as exc:
             raise HTTPException(
@@ -1371,19 +1252,19 @@ async def predict_citywide(
                     risk_score_v2,
 
                 # Legacy classifier values are preserved for comparison and
-                # backward-compatible analytics/debugging.
+                # backward-compatible analytics/debugging. They now mirror
+                # the V2 occurrence result to avoid loading the old model.
                 "legacy_risk_level":
-                    risk_level,
+                    risk_level_v2,
 
                 "legacy_risk_score":
-                    RISK_SCORE.get(
-                        risk_level,
-                        0,
-                    ),
+                    risk_score_v2,
 
                 "legacy_confidence":
                     round(
-                        confidence,
+                        occurrence_probability
+                        if flood_predicted
+                        else 1.0 - occurrence_probability,
                         6,
                     ),
 
@@ -1436,7 +1317,7 @@ async def predict_citywide(
                 # Depth remains from the legacy regression model until a
                 # replacement depth model is validated.
                 "predicted_depth_mm":
-                    predicted_depth,
+                    round(predicted_depth_mm, 2),
 
                 # Final V2 duration replaces the old duration value.
                 "predicted_duration_hours":
@@ -1486,7 +1367,7 @@ async def predict_citywide(
             item["flood_probability"],
             item["risk_score"],
             item["predicted_depth_ft"],
-            item["predicted_depth_mm"],
+            item["predicted_depth_ft"],
         ),
         reverse=True,
     )
@@ -1543,9 +1424,9 @@ async def predict_citywide(
             "duration":
                 "MAPS Flood Duration V2",
             "legacy_risk":
-                "maps_flood_risk_classifier.joblib",
+                "Replaced by MAPS Flood Occurrence V2",
             "legacy_depth":
-                "maps_flood_regression_model.joblib",
+                "Replaced by maps_flood_depth_regression_model.joblib",
             "flood_severity":
                 "maps_flood_severity_model.joblib",
             "flood_depth_feet":
