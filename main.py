@@ -149,6 +149,17 @@ duration_v2_model = load_model(
     "maps_flood_duration_v2.joblib"
 )
 
+# Severity and depth models trained from the CDRRMO flood-code records.
+# These are separate from the legacy models above: the classifier returns
+# flood codes A-D and the regressor returns a single depth value in feet.
+severity_model_bundle = load_model(
+    "maps_flood_severity_model.joblib"
+)
+
+depth_regression_bundle = load_model(
+    "maps_flood_depth_regression_model.joblib"
+)
+
 OCCURRENCE_V2_THRESHOLD = float(
     occurrence_v2_config.get("threshold", 0.18)
 )
@@ -190,6 +201,13 @@ RISK_SCORE = {
     "Low": 1,
     "Medium": 2,
     "High": 3,
+}
+
+FLOOD_SEVERITY_LABELS = {
+    "A": "Level A - Minor Flooding (1 ft)",
+    "B": "Level B - Moderate Flooding (2 ft)",
+    "C": "Level C - Severe Flooding (3 ft)",
+    "D": "Level D - Critical Flooding (4 ft)",
 }
 
 
@@ -390,6 +408,65 @@ def get_class_probability(
             0.0,
         ),
         probability_map,
+    )
+
+
+def build_flood_code_input(
+    bundle: dict[str, Any],
+    profile: BarangayProfile,
+    weather: dict[str, Any],
+    event_time: datetime,
+) -> pd.DataFrame:
+    """Build the 553-column input expected by the A-D and feet models."""
+    observed = weather["observed_rainfall"]
+    forecast = weather["forecast_rainfall"]
+    v2_weather = weather["v2_features"]
+
+    # Start with training medians, then replace every value available from
+    # Open-Meteo and the barangay profile.
+    row = dict(bundle["numeric_medians"])
+    row.update(
+        {
+            "BARANGAY": profile.barangay,
+            "STREET": "Unknown",
+            "CORNER": "Unknown",
+            "CAUSED": weather["condition"],
+            "YEAR": event_time.year,
+            "MONTH": event_time.month,
+            "DAY": event_time.day,
+            "HOUR": event_time.hour,
+            "DAY_OF_WEEK": event_time.weekday(),
+            "WET_SEASON": int(5 <= event_time.month <= 11),
+            "PEAK_HOUR": int(14 <= event_time.hour <= 20),
+            "PRIOR_BARANGAY_COUNT": profile.historical_flood_count_5y,
+            "DAYS_SINCE_BARANGAY": profile.days_since_previous_flood,
+            "LATITUDE": MANDALUYONG_LATITUDE,
+            "LONGITUDE": MANDALUYONG_LONGITUDE,
+            "TEMPERATURE_C": weather["temperature_c"],
+            "TEMPERATURE_MAX_C": v2_weather["temperature_max_c"],
+            "HUMIDITY_PCT": weather["humidity_pct"],
+            "RAINFALL_24H_MM": forecast["next_24h_mm"],
+            "RAIN_24H_MM": observed["past_24h_mm"],
+            "WIND_SPEED_KPH": weather["wind_speed_kph"],
+            "RAINFALL_3D_MM": (
+                observed["past_3d_mm"] + forecast["next_3d_mm"]
+            ),
+            "RAINFALL_7D_MM": (
+                observed["past_7d_mm"] + forecast["next_7d_mm"]
+            ),
+        }
+    )
+
+    raw = pd.DataFrame([row])
+    encoded = pd.get_dummies(
+        raw,
+        columns=bundle["categorical_features"],
+        dtype=int,
+    )
+
+    return encoded.reindex(
+        columns=bundle["feature_columns"],
+        fill_value=0,
     )
 
 
@@ -922,12 +999,16 @@ def health() -> dict[str, Any]:
     legacy_regression_loaded = regression_model is not None
     occurrence_v2_loaded = occurrence_v2_model is not None
     duration_v2_loaded = duration_v2_model is not None
+    severity_model_loaded = severity_model_bundle is not None
+    depth_feet_model_loaded = depth_regression_bundle is not None
 
     healthy = (
         occurrence_v2_loaded
         and duration_v2_loaded
         and legacy_risk_loaded
         and legacy_regression_loaded
+        and severity_model_loaded
+        and depth_feet_model_loaded
     )
 
     return {
@@ -938,6 +1019,8 @@ def health() -> dict[str, Any]:
         "occurrence_threshold": OCCURRENCE_V2_THRESHOLD,
         "legacy_risk_model_loaded": legacy_risk_loaded,
         "legacy_depth_model_loaded": legacy_regression_loaded,
+        "flood_severity_model_loaded": severity_model_loaded,
+        "flood_depth_feet_model_loaded": depth_feet_model_loaded,
         "metadata_loaded": True,
     }
 
@@ -1130,6 +1213,13 @@ async def predict_citywide(
             ]
         )
 
+        flood_code_input = build_flood_code_input(
+            severity_model_bundle,
+            profile,
+            weather,
+            manila_now,
+        )
+
         try:
             # ---------------- FINAL OCCURRENCE V2 ----------------
             occurrence_probability = float(
@@ -1199,6 +1289,40 @@ async def predict_citywide(
                 raw_regression
             )
 
+            # ---------------- FLOOD CODE + DEPTH IN FEET --------
+            # The A-D code and feet estimate are supplemental outputs from
+            # the latest CDRRMO-record model. Existing fields remain intact.
+            severity_probabilities = (
+                severity_model_bundle["model"].predict_proba(
+                    flood_code_input
+                )[0]
+            )
+            severity_code = str(
+                severity_model_bundle["model"].classes_[
+                    int(np.argmax(severity_probabilities))
+                ]
+            )
+            severity_probability_map = {
+                str(code): round(float(probability), 6)
+                for code, probability in zip(
+                    severity_model_bundle["model"].classes_,
+                    severity_probabilities,
+                )
+            }
+            predicted_depth_ft = max(
+                float(
+                    depth_regression_bundle["model"].predict(
+                        build_flood_code_input(
+                            depth_regression_bundle,
+                            profile,
+                            weather,
+                            manila_now,
+                        )
+                    )[0]
+                ),
+                0.0,
+            )
+
         except Exception as exc:
             raise HTTPException(
                 status_code=500,
@@ -1265,6 +1389,19 @@ async def predict_citywide(
 
                 "legacy_probabilities":
                     probabilities,
+
+                # Latest flood-code classifier and tuned depth regressor.
+                "flood_code": severity_code,
+                "flood_severity": FLOOD_SEVERITY_LABELS.get(
+                    severity_code,
+                    "Unknown flood severity",
+                ),
+                "flood_severity_confidence": round(
+                    max(severity_probabilities),
+                    6,
+                ),
+                "flood_severity_probabilities": severity_probability_map,
+                "predicted_depth_ft": round(predicted_depth_ft, 2),
 
                # Primary confidence now follows Flood Occurrence V2.
 # For Flood, confidence equals the flood probability.
@@ -1348,6 +1485,7 @@ async def predict_citywide(
             int(item["flood_predicted"]),
             item["flood_probability"],
             item["risk_score"],
+            item["predicted_depth_ft"],
             item["predicted_depth_mm"],
         ),
         reverse=True,
@@ -1408,6 +1546,10 @@ async def predict_citywide(
                 "maps_flood_risk_classifier.joblib",
             "legacy_depth":
                 "maps_flood_regression_model.joblib",
+            "flood_severity":
+                "maps_flood_severity_model.joblib",
+            "flood_depth_feet":
+                "maps_flood_depth_regression_model.joblib",
         },
 
         "weather":
@@ -1441,6 +1583,11 @@ async def predict_citywide(
                     item["predicted_depth_mm"]
                     for item in results
                 ),
+
+            "highest_predicted_depth_ft": max(
+                item["predicted_depth_ft"]
+                for item in results
+            ),
 
             "longest_predicted_duration_hours":
                 max(
