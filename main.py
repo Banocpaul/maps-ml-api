@@ -139,13 +139,9 @@ duration_v2_model = load_model(
     "maps_flood_duration_v2.joblib"
 )
 
-# Severity and depth models trained from the CDRRMO flood-code records.
-# These are separate from the legacy models above: the classifier returns
-# flood codes A-D and the regressor returns a single depth value in feet.
-severity_model_bundle = load_model(
-    "maps_flood_severity_model.joblib"
-)
-
+# The compact depth regressor is used for the free Render instance.
+# Flood code A-D is derived directly from the predicted depth in feet.
+# The separate 127 MB severity classifier is intentionally not loaded.
 depth_regression_bundle = load_model(
     "maps_flood_depth_regression_model.joblib"
 )
@@ -987,13 +983,12 @@ def health() -> dict[str, Any]:
     """Health endpoint used by Laravel and Render."""
     occurrence_v2_loaded = occurrence_v2_model is not None
     duration_v2_loaded = duration_v2_model is not None
-    severity_model_loaded = severity_model_bundle is not None
+    severity_model_loaded = False
     depth_feet_model_loaded = depth_regression_bundle is not None
 
     healthy = (
         occurrence_v2_loaded
         and duration_v2_loaded
-        and severity_model_loaded
         and depth_feet_model_loaded
     )
 
@@ -1113,7 +1108,7 @@ async def predict_citywide(
         )
 
         flood_code_input = build_flood_code_input(
-            severity_model_bundle,
+            depth_regression_bundle,
             profile,
             weather,
             manila_now,
@@ -1160,39 +1155,21 @@ async def predict_citywide(
                 0.0,
             )
 
-            # ---------------- FLOOD CODE + DEPTH IN FEET --------
-            # The A-D code and feet estimate are supplemental outputs from
-            # the latest CDRRMO-record model. Existing fields remain intact.
-            severity_probabilities = (
-                severity_model_bundle["model"].predict_proba(
-                    flood_code_input
-                )[0]
-            )
-            severity_code = str(
-                severity_model_bundle["model"].classes_[
-                    int(np.argmax(severity_probabilities))
-                ]
-            )
-            severity_probability_map = {
-                str(code): round(float(probability), 6)
-                for code, probability in zip(
-                    severity_model_bundle["model"].classes_,
-                    severity_probabilities,
-                )
-            }
+            # ---------------- FLOOD DEPTH + A-D CODE ------------
+            # Predict feet with the compact regressor, then map the result
+            # to the documented A-D depth bands.
             predicted_depth_ft = max(
-                float(
-                    depth_regression_bundle["model"].predict(
-                        build_flood_code_input(
-                            depth_regression_bundle,
-                            profile,
-                            weather,
-                            manila_now,
-                        )
-                    )[0]
-                ),
+                float(depth_regression_bundle["model"].predict(flood_code_input)[0]),
                 0.0,
             )
+            if predicted_depth_ft < 1.5:
+                severity_code = "A"
+            elif predicted_depth_ft < 2.5:
+                severity_code = "B"
+            elif predicted_depth_ft < 3.5:
+                severity_code = "C"
+            else:
+                severity_code = "D"
 
             # Compatibility values allow the existing Laravel views to keep
             # working without retaining two large legacy models in memory.
@@ -1277,11 +1254,8 @@ async def predict_citywide(
                     severity_code,
                     "Unknown flood severity",
                 ),
-                "flood_severity_confidence": round(
-                    max(severity_probabilities),
-                    6,
-                ),
-                "flood_severity_probabilities": severity_probability_map,
+                "flood_severity_confidence": None,
+                "flood_severity_probabilities": {},
                 "predicted_depth_ft": round(predicted_depth_ft, 2),
 
                # Primary confidence now follows Flood Occurrence V2.
@@ -1428,7 +1402,7 @@ async def predict_citywide(
             "legacy_depth":
                 "Replaced by maps_flood_depth_regression_model.joblib",
             "flood_severity":
-                "maps_flood_severity_model.joblib",
+                "Derived from predicted depth (A-D bands)",
             "flood_depth_feet":
                 "maps_flood_depth_regression_model.joblib",
         },
