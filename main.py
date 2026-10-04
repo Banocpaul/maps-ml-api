@@ -104,7 +104,7 @@ _weather_cache, _weather_cache_fetched_at = (
 
 app = FastAPI(
     title="M.A.P.S. ML API",
-    version="2.3.1",
+    version="2.4.0",
     description=(
         "A-D flood severity prediction for Mandaluyong City with live "
         "24/48/72-hour forecasts and rainfall-only simulation."
@@ -164,6 +164,7 @@ class CitywidePredictionRequest(BaseModel):
     forecast_hours: int = 24
     barangays: list[BarangayProfile]
     simulation: RainfallSimulation | None = None
+    weather_context: dict[str, Any] | None = None
 
 
 # ============================================================
@@ -340,6 +341,357 @@ def build_severity_input(
             }
         ]
     )
+
+
+
+def normalize_laravel_weather_context(
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    # Normalize Laravel's cached daily weather snapshot into the
+    # structure used by the severity prediction route.
+    forecast_windows_raw = context.get("forecast_windows", {})
+
+    if not isinstance(forecast_windows_raw, dict):
+        forecast_windows_raw = {}
+
+    def get_forecast_window(hours: int) -> dict[str, Any]:
+        value = (
+            forecast_windows_raw.get(str(hours))
+            or forecast_windows_raw.get(hours)
+            or {}
+        )
+        return value if isinstance(value, dict) else {}
+
+    normalized_forecast_windows: dict[str, dict[str, Any]] = {}
+
+    for hours in (24, 48, 72):
+        source_window = get_forecast_window(hours)
+
+        normalized_forecast_windows[str(hours)] = {
+            "hours": hours,
+            "start": source_window.get("start"),
+            "end": source_window.get("end"),
+            "start_display": source_window.get("start_display"),
+            "end_display": source_window.get("end_display"),
+            "rainfall_mm": round(
+                safe_float(source_window.get("rainfall_mm")),
+                2,
+            ),
+        }
+
+    raw_prediction_windows = context.get("prediction_windows")
+
+    if (
+        isinstance(raw_prediction_windows, list)
+        and len(raw_prediction_windows) >= 3
+    ):
+        prediction_windows: list[dict[str, Any]] = []
+
+        for index, raw_window in enumerate(
+            raw_prediction_windows[:3],
+            start=1,
+        ):
+            if not isinstance(raw_window, dict):
+                continue
+
+            prediction_windows.append(
+                {
+                    "window_number": int(
+                        safe_float(
+                            raw_window.get("window_number"),
+                            index,
+                        )
+                    ),
+                    "hours_from_now_start": int(
+                        safe_float(
+                            raw_window.get("hours_from_now_start"),
+                            (index - 1) * 24,
+                        )
+                    ),
+                    "hours_from_now_end": int(
+                        safe_float(
+                            raw_window.get("hours_from_now_end"),
+                            index * 24,
+                        )
+                    ),
+                    "start": str(raw_window.get("start")),
+                    "end": str(raw_window.get("end")),
+                    "start_display": str(
+                        raw_window.get("start_display", "")
+                    ),
+                    "end_display": str(
+                        raw_window.get("end_display", "")
+                    ),
+                    "rainfall_24h_mm": safe_float(
+                        raw_window.get("rainfall_24h_mm")
+                    ),
+                    "rainfall_3d_mm": safe_float(
+                        raw_window.get("rainfall_3d_mm")
+                    ),
+                    "rainfall_7d_mm": safe_float(
+                        raw_window.get("rainfall_7d_mm")
+                    ),
+                    "max_hourly_rain_mm": safe_float(
+                        raw_window.get("max_hourly_rain_mm")
+                    ),
+                    "temperature_mean_c": safe_float(
+                        raw_window.get("temperature_mean_c"),
+                        27.62,
+                    ),
+                    "temperature_max_c": safe_float(
+                        raw_window.get("temperature_max_c"),
+                        31.28,
+                    ),
+                    "temperature_min_c": safe_float(
+                        raw_window.get("temperature_min_c"),
+                        24.61,
+                    ),
+                    "humidity_mean_pct": safe_float(
+                        raw_window.get("humidity_mean_pct"),
+                        80.0,
+                    ),
+                    "wind_speed_mean_kph": safe_float(
+                        raw_window.get("wind_speed_mean_kph"),
+                        7.79,
+                    ),
+                    "wind_speed_max_kph": safe_float(
+                        raw_window.get("wind_speed_max_kph"),
+                        7.79,
+                    ),
+                }
+            )
+
+        if len(prediction_windows) >= 3:
+            support_source = "laravel-exact-prediction-windows"
+        else:
+            prediction_windows = []
+            support_source = "laravel-snapshot-reconstruction"
+    else:
+        prediction_windows = []
+        support_source = "laravel-snapshot-reconstruction"
+
+    if len(prediction_windows) < 3:
+        fw24 = get_forecast_window(24)
+        fw48 = get_forecast_window(48)
+        fw72 = get_forecast_window(72)
+
+        total24 = max(
+            0.0,
+            safe_float(fw24.get("rainfall_mm")),
+        )
+        total48 = max(
+            total24,
+            safe_float(fw48.get("rainfall_mm")),
+        )
+        total72 = max(
+            total48,
+            safe_float(fw72.get("rainfall_mm")),
+        )
+
+        segment_rain = [
+            total24,
+            max(0.0, total48 - total24),
+            max(0.0, total72 - total48),
+        ]
+
+        past24 = max(
+            0.0,
+            safe_float(context.get("rainfall_24h_mm")),
+        )
+        past3d = max(
+            past24,
+            safe_float(context.get("rainfall_3d_mm")),
+        )
+        past7d = max(
+            past3d,
+            safe_float(context.get("rainfall_7d_mm")),
+        )
+
+        rain3d = [
+            max(0.0, past3d - past24) + segment_rain[0],
+            past24 + segment_rain[0] + segment_rain[1],
+            sum(segment_rain),
+        ]
+
+        older_four_days = max(0.0, past7d - past3d)
+        estimated_old_day = older_four_days / 4.0
+
+        rain7d = [
+            max(
+                rain3d[0],
+                past7d - estimated_old_day + segment_rain[0],
+            ),
+            max(
+                rain3d[1],
+                past7d
+                - (estimated_old_day * 2.0)
+                + segment_rain[0]
+                + segment_rain[1],
+            ),
+            max(
+                rain3d[2],
+                past7d
+                - (estimated_old_day * 3.0)
+                + sum(segment_rain),
+            ),
+        ]
+
+        first_start_raw = (
+            fw24.get("start")
+            or context.get("observed_at")
+        )
+
+        try:
+            first_start = datetime.fromisoformat(
+                str(first_start_raw)
+            )
+        except (TypeError, ValueError):
+            first_start = datetime.now(
+                ZoneInfo(MANILA_TIMEZONE)
+            )
+
+        if first_start.tzinfo is None:
+            first_start = first_start.replace(
+                tzinfo=ZoneInfo(MANILA_TIMEZONE)
+            )
+
+        prediction_windows = []
+
+        for index, hours in enumerate((24, 48, 72)):
+            cumulative = get_forecast_window(hours)
+            start = first_start + timedelta(
+                hours=(index * 24)
+            )
+            end = start + timedelta(hours=24)
+
+            wind_mean_ms = safe_float(
+                cumulative.get("wind_speed_mean"),
+                safe_float(
+                    context.get("avg_wind_speed"),
+                    2.16,
+                ),
+            )
+            wind_max_ms = safe_float(
+                cumulative.get("wind_speed_max"),
+                wind_mean_ms,
+            )
+
+            prediction_windows.append(
+                {
+                    "window_number": index + 1,
+                    "hours_from_now_start": index * 24,
+                    "hours_from_now_end": (index + 1) * 24,
+                    "start": start.isoformat(),
+                    "end": end.isoformat(),
+                    "start_display": start.strftime(
+                        "%b %d, %Y %I:%M %p"
+                    ),
+                    "end_display": end.strftime(
+                        "%b %d, %Y %I:%M %p"
+                    ),
+                    "rainfall_24h_mm": round(
+                        segment_rain[index],
+                        2,
+                    ),
+                    "rainfall_3d_mm": round(
+                        rain3d[index],
+                        2,
+                    ),
+                    "rainfall_7d_mm": round(
+                        rain7d[index],
+                        2,
+                    ),
+                    "max_hourly_rain_mm": 0.0,
+                    "temperature_mean_c": safe_float(
+                        cumulative.get("temperature_mean_c"),
+                        safe_float(
+                            context.get("forecast_mean_temp_c"),
+                            27.62,
+                        ),
+                    ),
+                    "temperature_max_c": safe_float(
+                        cumulative.get("temperature_max_c"),
+                        safe_float(
+                            context.get("forecast_tmax_c"),
+                            31.28,
+                        ),
+                    ),
+                    "temperature_min_c": safe_float(
+                        cumulative.get("temperature_min_c"),
+                        safe_float(
+                            context.get("forecast_tmin_c"),
+                            24.61,
+                        ),
+                    ),
+                    "humidity_mean_pct": safe_float(
+                        cumulative.get("humidity_mean_pct"),
+                        safe_float(
+                            context.get(
+                                "forecast_avg_humidity_pct"
+                            ),
+                            80.0,
+                        ),
+                    ),
+                    "wind_speed_mean_kph": round(
+                        wind_mean_ms * 3.6,
+                        2,
+                    ),
+                    "wind_speed_max_kph": round(
+                        wind_max_ms * 3.6,
+                        2,
+                    ),
+                }
+            )
+
+    return {
+        "source": context.get(
+            "source",
+            "Laravel daily weather snapshot",
+        ),
+        "prediction_weather_source": support_source,
+        "weather_is_stale": bool(
+            context.get("weather_is_stale", False)
+        ),
+        "current_date": context.get("date"),
+        "current_time": context.get("time"),
+        "generated_at": context.get(
+            "observed_at",
+            datetime.now(
+                ZoneInfo(MANILA_TIMEZONE)
+            ).isoformat(),
+        ),
+        "condition": context.get(
+            "weather_description",
+            "Weather data available",
+        ),
+        "temperature_c": safe_float(
+            context.get("current_temperature_c"),
+            safe_float(
+                context.get("avg_temp_mean_c"),
+                27.62,
+            ),
+        ),
+        "humidity_pct": safe_float(
+            context.get("avg_rh_pct"),
+            80.0,
+        ),
+        "wind_speed_kph": round(
+            safe_float(
+                context.get("avg_wind_speed"),
+                2.16,
+            ) * 3.6,
+            2,
+        ),
+        "wind_direction_deg": safe_float(
+            context.get("avg_wind_direction_deg"),
+            217.0,
+        ),
+        "storm_signal": int(
+            safe_float(context.get("storm_signal"), 0)
+        ),
+        "forecast_windows": normalized_forecast_windows,
+        "prediction_windows": prediction_windows,
+    }
 
 
 # ============================================================
@@ -760,7 +1112,7 @@ def home() -> dict[str, Any]:
     return {
         "success": True,
         "message": "M.A.P.S. ML API is running.",
-        "version": "2.3.1",
+        "version": "2.4.0",
         "status": "running",
         "supported_forecast_hours": [24, 48, 72],
         "endpoints": {
@@ -778,7 +1130,7 @@ def health() -> dict[str, Any]:
 
     return {
         "status": "healthy" if severity_model_loaded else "degraded",
-        "api_version": "2.3.1",
+        "api_version": "2.4.0",
         "prediction_type": "severity_only",
         "supported_forecast_hours": [24, 48, 72],
         "flood_severity_model_loaded": severity_model_loaded,
@@ -983,9 +1335,19 @@ async def predict_citywide(
     # ------------------------------------------------------------
     # LIVE FORECAST
     # ------------------------------------------------------------
-    # Normal 24/48/72-hour prediction still uses Open-Meteo.
+    # The Laravel web app owns the single daily Open-Meteo request.
+    # When it supplies weather_context, reuse that exact snapshot and
+    # do not call Open-Meteo from FastAPI.
     else:
-        weather = await fetch_live_weather()
+        if isinstance(request.weather_context, dict):
+            weather = normalize_laravel_weather_context(
+                request.weather_context
+            )
+        else:
+            # Compatibility fallback for direct API clients that do not
+            # provide Laravel's cached weather context.
+            weather = await fetch_live_weather()
+
         prediction_windows = weather.get("prediction_windows", [])
         windows_needed = forecast_hours // 24
         selected_windows = deepcopy(
