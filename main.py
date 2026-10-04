@@ -104,7 +104,7 @@ _weather_cache, _weather_cache_fetched_at = (
 
 app = FastAPI(
     title="M.A.P.S. ML API",
-    version="2.3.0",
+    version="2.3.1",
     description=(
         "A-D flood severity prediction for Mandaluyong City with live "
         "24/48/72-hour forecasts and rainfall-only simulation."
@@ -255,8 +255,8 @@ def clean_barangay_name(name: str) -> str:
     cleaned = " ".join(str(name).strip().split())
 
     mapping = {
-        "New Zaniga": "New Zañiga",
-        "Old Zaniga": "Old Zañiga",
+        "New Zaniga": "New ZaÃ±iga",
+        "Old Zaniga": "Old ZaÃ±iga",
         "Pagasa": "Pag-Asa",
         "Pag-asa": "Pag-Asa",
         "Mabini J. Rizal": "Mabini-J. Rizal",
@@ -272,23 +272,23 @@ def get_weather_description(
     weather_code: int,
 ) -> dict[str, str]:
     if weather_code == 0:
-        return {"condition": "Clear sky", "icon": "☀️"}
+        return {"condition": "Clear sky", "icon": "â˜€ï¸"}
     if weather_code in [1, 2]:
-        return {"condition": "Partly cloudy", "icon": "🌤️"}
+        return {"condition": "Partly cloudy", "icon": "ðŸŒ¤ï¸"}
     if weather_code == 3:
-        return {"condition": "Overcast", "icon": "☁️"}
+        return {"condition": "Overcast", "icon": "â˜ï¸"}
     if weather_code in [45, 48]:
-        return {"condition": "Foggy", "icon": "🌫️"}
+        return {"condition": "Foggy", "icon": "ðŸŒ«ï¸"}
     if weather_code in [51, 53, 55, 56, 57]:
-        return {"condition": "Drizzle", "icon": "🌦️"}
+        return {"condition": "Drizzle", "icon": "ðŸŒ¦ï¸"}
     if weather_code in [61, 63, 65, 66, 67]:
-        return {"condition": "Rain", "icon": "🌧️"}
+        return {"condition": "Rain", "icon": "ðŸŒ§ï¸"}
     if weather_code in [80, 81, 82]:
-        return {"condition": "Rain showers", "icon": "🌦️"}
+        return {"condition": "Rain showers", "icon": "ðŸŒ¦ï¸"}
     if weather_code in [95, 96, 99]:
-        return {"condition": "Thunderstorm", "icon": "⛈️"}
+        return {"condition": "Thunderstorm", "icon": "â›ˆï¸"}
 
-    return {"condition": "Unknown weather", "icon": "🌡️"}
+    return {"condition": "Unknown weather", "icon": "ðŸŒ¡ï¸"}
 
 
 def build_severity_input(
@@ -760,7 +760,7 @@ def home() -> dict[str, Any]:
     return {
         "success": True,
         "message": "M.A.P.S. ML API is running.",
-        "version": "2.2.0",
+        "version": "2.3.1",
         "status": "running",
         "supported_forecast_hours": [24, 48, 72],
         "endpoints": {
@@ -778,7 +778,7 @@ def health() -> dict[str, Any]:
 
     return {
         "status": "healthy" if severity_model_loaded else "degraded",
-        "api_version": "2.2.0",
+        "api_version": "2.3.1",
         "prediction_type": "severity_only",
         "supported_forecast_hours": [24, 48, 72],
         "flood_severity_model_loaded": severity_model_loaded,
@@ -816,22 +816,18 @@ async def predict_citywide(
             detail="forecast_hours must be 24, 48, or 72.",
         )
 
-    weather = await fetch_live_weather()
-    prediction_windows = weather.get("prediction_windows", [])
-    windows_needed = forecast_hours // 24
-    selected_windows = deepcopy(prediction_windows[:windows_needed])
-
-    if len(selected_windows) != windows_needed:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Weather data does not contain enough 24-hour prediction "
-                "windows for the selected forecast period."
-            ),
-        )
-
     simulation = request.simulation
 
+    # ------------------------------------------------------------
+    # RAINFALL SIMULATION
+    # ------------------------------------------------------------
+    # A manual rainfall simulation must not fail just because the
+    # external Open-Meteo service is unavailable or rate-limited.
+    #
+    # Rainfall comes from the operator. Supporting temperature/wind
+    # values use the most recent in-memory weather cache when available.
+    # If there is no cache (for example after a fresh Render deploy),
+    # use medians from the severity model training dataset.
     if simulation is not None:
         if forecast_hours != 24:
             raise HTTPException(
@@ -870,16 +866,147 @@ async def predict_citywide(
                 ),
             )
 
-        # Keep temperature and wind from the live weather window, but
-        # replace rainfall with the operator's hypothetical accumulation.
-        selected_windows[0]["rainfall_24h_mm"] = rainfall_24h
-        selected_windows[0]["rainfall_3d_mm"] = rainfall_3d
-        selected_windows[0]["rainfall_7d_mm"] = rainfall_7d
+        manila_tz = ZoneInfo(MANILA_TIMEZONE)
+        simulation_start = datetime.now(manila_tz).replace(
+            second=0,
+            microsecond=0,
+        )
+        simulation_end = simulation_start + timedelta(hours=24)
 
-    storm_signal = int(safe_float(weather.get("storm_signal", 0)))
-    wind_direction_deg = safe_float(
-        weather.get("wind_direction_deg", 0.0)
-    )
+        cached_weather = (
+            deepcopy(_weather_cache)
+            if isinstance(_weather_cache, dict)
+            else {}
+        )
+
+        cached_windows = cached_weather.get("prediction_windows", [])
+        cached_window = (
+            cached_windows[0]
+            if isinstance(cached_windows, list) and cached_windows
+            else {}
+        )
+
+        if cached_window:
+            support_source = "cached-live-weather"
+        else:
+            support_source = "training-data-medians"
+
+        # Fallback values are medians from the 6,874-row A-D
+        # severity-model training dataset:
+        # TEMP=27.62 C, MAX=31.28 C, MIN=24.61 C,
+        # WIND=7.79 km/h, WIND DIRECTION=217 degrees.
+        temperature_mean = safe_float(
+            cached_window.get("temperature_mean_c"),
+            safe_float(cached_weather.get("temperature_c"), 27.62),
+        )
+        temperature_max = safe_float(
+            cached_window.get("temperature_max_c"),
+            31.28,
+        )
+        temperature_min = safe_float(
+            cached_window.get("temperature_min_c"),
+            24.61,
+        )
+        wind_speed_mean = safe_float(
+            cached_window.get("wind_speed_mean_kph"),
+            safe_float(cached_weather.get("wind_speed_kph"), 7.79),
+        )
+        wind_speed_max = safe_float(
+            cached_window.get("wind_speed_max_kph"),
+            safe_float(cached_weather.get("wind_speed_kph"), 7.79),
+        )
+        humidity_mean = safe_float(
+            cached_window.get("humidity_mean_pct"),
+            safe_float(cached_weather.get("humidity_pct"), 80.0),
+        )
+
+        storm_signal = int(
+            safe_float(cached_weather.get("storm_signal"), 0)
+        )
+        wind_direction_deg = safe_float(
+            cached_weather.get("wind_direction_deg"),
+            217.0,
+        )
+
+        simulation_window = {
+            "window_number": 1,
+            "hours_from_now_start": 0,
+            "hours_from_now_end": 24,
+            "start": simulation_start.isoformat(),
+            "end": simulation_end.isoformat(),
+            "start_display": simulation_start.strftime(
+                "%b %d, %Y %I:%M %p"
+            ),
+            "end_display": simulation_end.strftime(
+                "%b %d, %Y %I:%M %p"
+            ),
+            "rainfall_24h_mm": rainfall_24h,
+            "rainfall_3d_mm": rainfall_3d,
+            "rainfall_7d_mm": rainfall_7d,
+            "max_hourly_rain_mm": 0.0,
+            "temperature_mean_c": temperature_mean,
+            "temperature_max_c": temperature_max,
+            "temperature_min_c": temperature_min,
+            "humidity_mean_pct": humidity_mean,
+            "wind_speed_mean_kph": wind_speed_mean,
+            "wind_speed_max_kph": wind_speed_max,
+        }
+
+        selected_windows = [simulation_window]
+
+        weather = {
+            "source": "Rainfall Simulation",
+            "simulation_support_source": support_source,
+            "current_date": simulation_start.strftime("%B %d, %Y"),
+            "current_time": simulation_start.strftime("%I:%M:%S %p"),
+            "generated_at": simulation_start.isoformat(),
+            "forecast_horizon": "24-hour rainfall severity simulation",
+            "condition": "Simulation",
+            "temperature_c": temperature_mean,
+            "humidity_pct": humidity_mean,
+            "wind_speed_kph": wind_speed_max,
+            "wind_direction_deg": wind_direction_deg,
+            "storm_signal": storm_signal,
+            "prediction_windows": selected_windows,
+            "forecast_windows": {
+                "24": {
+                    "hours": 24,
+                    "start": simulation_window["start"],
+                    "end": simulation_window["end"],
+                    "start_display": simulation_window["start_display"],
+                    "end_display": simulation_window["end_display"],
+                    "rainfall_mm": round(rainfall_24h, 2),
+                }
+            },
+        }
+
+    # ------------------------------------------------------------
+    # LIVE FORECAST
+    # ------------------------------------------------------------
+    # Normal 24/48/72-hour prediction still uses Open-Meteo.
+    else:
+        weather = await fetch_live_weather()
+        prediction_windows = weather.get("prediction_windows", [])
+        windows_needed = forecast_hours // 24
+        selected_windows = deepcopy(
+            prediction_windows[:windows_needed]
+        )
+
+        if len(selected_windows) != windows_needed:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Weather data does not contain enough 24-hour "
+                    "prediction windows for the selected forecast period."
+                ),
+            )
+
+        storm_signal = int(
+            safe_float(weather.get("storm_signal", 0))
+        )
+        wind_direction_deg = safe_float(
+            weather.get("wind_direction_deg", 0.0)
+        )
 
     results: list[dict[str, Any]] = []
 
